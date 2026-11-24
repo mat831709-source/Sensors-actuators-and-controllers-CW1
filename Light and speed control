@@ -1,0 +1,385 @@
+#include <Wire.h>
+
+// ================= PINS =================
+const int M_EN = 6, M_IN1 = 7, M_IN2 = 8;   // L293D pins 1, 2, 7
+const int LED_PIN = 5;                       // via resistor to LED
+const int LDR_PIN = A0;                      // LDR / 10k junction
+const uint8_t AS5600 = 0x36;                 // SDA = A4, SCL = A5
+
+const unsigned long CONTROL_MS = 20;         // both loops run every 20 ms
+
+// ================= MOTOR LOOP =================
+float mKp = 0.02, mKi = 0.3;      // PWM per RPM, PWM per RPM per second
+float mSP = 0;                    // setpoint, RPM
+bool  mOpen = false;  int mOpenPWM = 0;
+bool  reverseDir = false;
+float mI = 0, rpmFilt = 0;  int mPWM = 0;
+const float RPM_ALPHA = 0.3;
+
+// Speed measurement
+int lastRaw = -1;  long countAccum = 0;
+unsigned long lastReadUs = 0;            // time of the previous angle reading (microseconds)
+unsigned long timeAccumUs = 0;           // time actually covered by the counted readings
+const unsigned long MAX_GAP_US = 2500;   // readings further apart than this aren't compared
+                                         // (half a turn in 2.5 ms = 12,000 RPM limit)
+unsigned long lastSpeedMs = 0;           // last time a valid speed was calculated
+
+unsigned long lastI2C = 0;        // last time the sensor replied at all
+unsigned long lastValid = 0;      // last time it replied AND saw the magnet
+int failStreak = 0;  unsigned long samples = 0, magSamples = 0;
+
+// Fault handling
+const unsigned long I2C_LOST_MS = 200;    // no reply this long = stop
+const unsigned long MAG_LOST_MS = 500;    // no magnet this long = nudge
+const unsigned long SPEED_STALE_MS = 300; // no usable speed data this long = stop
+const int NUDGE_PWM = 160;                // short push to move off a dead angle
+const unsigned long NUDGE_MS = 150, NUDGE_GAP_MS = 2000;
+const int MAX_NUDGES = 5;
+int nudgeCount = 0;  unsigned long lastNudge = 0;
+int warnState = 0;                // 0 ok, 1 I2C lost, 2 magnet lost, 3 gave up, 4 speed stale
+unsigned long stallStart = 0;
+
+// ================= LIGHT LOOP =================
+float lKp = 0.6, lKi = 4.0;       // PWM per %, PWM per % per second
+float lSP = 50;                   // setpoint, % of calibrated range
+bool  lOpen = false;  int lOpenPWM = 0;
+float lI = 0, lPV = 0, ldrFilt = 0;  int lPWM = 0;
+float ldrMin = 0, ldrMax = 1023;
+const float LDR_ALPHA = 0.3;
+
+// ================= GENERAL =================
+unsigned long lastControl = 0, lastPrint = 0;
+int view = 0;                     // 0 = both, 1 = motor only, 2 = light only
+String buffer = "";
+unsigned long lastCharTime = 0;
+
+// ---------- AS5600 ----------
+// Returns 0 = OK, 1 = no I2C reply, 2 = no magnet detected
+int readSensor(int &raw) {
+  Wire.beginTransmission(AS5600);
+  Wire.write(0x0B);
+  if (Wire.endTransmission(false) != 0) return 1;
+  if (Wire.requestFrom(AS5600, (uint8_t)3) != 3) return 1;
+  uint8_t s = Wire.read(), hi = Wire.read(), lo = Wire.read();
+  raw = ((hi & 0x0F) << 8) | lo;
+  return (s & 0x20) ? 0 : 2;
+}
+
+// Frees a stuck bus: if the sensor is holding SDA low, clock it until it lets go
+void recoverI2C() {
+  Wire.end();
+  pinMode(A4, INPUT);                          // release SDA and SCL
+  pinMode(A5, INPUT);                          // (pull-ups hold them high)
+  for (int i = 0; i < 16 && digitalRead(A4) == LOW; i++) {
+    digitalWrite(A5, LOW); pinMode(A5, OUTPUT); delayMicroseconds(5);   // SCL low
+    pinMode(A5, INPUT);                         delayMicroseconds(5);   // SCL high
+  }
+  digitalWrite(A4, LOW); pinMode(A4, OUTPUT); delayMicroseconds(5);     // STOP condition:
+  pinMode(A4, INPUT);                         delayMicroseconds(5);     // SDA low then high
+  Wire.begin();
+}
+
+void printMagnetStatus() {
+  Wire.beginTransmission(AS5600);
+  Wire.write(0x0B);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(AS5600, (uint8_t)1) != 1) {
+    Serial.println("AS5600: NO I2C REPLY - check wiring and pull-ups");
+    return;
+  }
+  uint8_t s = Wire.read();
+  if (!(s & 0x20))   Serial.println("AS5600: NO MAGNET DETECTED");
+  else if (s & 0x10) Serial.println("AS5600: magnet too weak (may still work)");
+  else if (s & 0x08) Serial.println("AS5600: magnet too strong");
+  else               Serial.println("AS5600: magnet OK");
+}
+
+// ---------- Motor ----------
+void setDirection() {
+  digitalWrite(M_IN1, reverseDir ? LOW : HIGH);
+  digitalWrite(M_IN2, reverseDir ? HIGH : LOW);
+}
+
+void stopMotor() { mPWM = 0; mI = 0; analogWrite(M_EN, 0); }
+
+void warn(int state, const char *msg) {        // print each fault once
+  if (warnState != state) { Serial.println(msg); warnState = state; }
+}
+
+void setMotorSP(float v) {
+  if (mOpen) mI = mPWM;                        // bumpless switch from open loop
+  mOpen = false;
+  mSP = max(0.0f, v);
+  if (mSP == 0) mI = 0;
+  nudgeCount = 0; stallStart = 0; warnState = 0;
+  Serial.print("MOTOR SETPOINT = "); Serial.print(mSP); Serial.println(" RPM");
+}
+
+// ---------- Light ----------
+float readLDR(int n) {
+  long t = 0;
+  for (int i = 0; i < n; i++) t += analogRead(LDR_PIN);
+  return t / (float)n;
+}
+
+float lightPercent(float raw) {
+  float span = max(ldrMax - ldrMin, 1.0f);
+  return (raw - ldrMin) / span * 100.0;
+}
+
+void calibrateLight() {
+  stopMotor();                                 // motor off while we pause
+  Serial.println("Calibrating light loop (about 1.5 s)...");
+  analogWrite(LED_PIN, 0);   delay(700); ldrMin = readLDR(50);
+  analogWrite(LED_PIN, 255); delay(700); ldrMax = readLDR(50);
+  analogWrite(LED_PIN, 0);
+  ldrFilt = ldrMin; lI = 0;
+  Serial.print("LDR dark (0%) = "); Serial.print(ldrMin);
+  Serial.print("   LED full (100%) = "); Serial.println(ldrMax);
+  if (ldrMax - ldrMin < 20)
+    Serial.println("WARNING: LED barely changes the LDR - point it at the LDR and shade both");
+  lastValid = millis(); lastI2C = millis(); lastSpeedMs = millis();
+}
+
+// ---------- Serial commands ----------
+// Reads the number after position i. Returns false if there isn't one,
+// so a typo can never be mistaken for 0.
+bool getNum(int i, float &v) {
+  String t = buffer.substring(i);
+  t.trim();
+  if (t.length() == 0) return false;
+  char c = t.charAt(0);
+  if (!(isDigit(c) || c == '.' || c == '-')) return false;
+  v = t.toFloat();
+  return true;
+}
+
+void processInput() {
+  buffer.trim();
+  buffer.toLowerCase();
+  if (buffer.length() == 0) return;
+  char first = buffer.charAt(0);
+  float v = 0;
+  bool needNum = false;                        // set if a number was missing
+
+  if      (buffer.startsWith("mp")) { if (getNum(2, v)) { mKp = v; Serial.print("Motor Kp = "); Serial.println(mKp, 4); } else needNum = true; }
+  else if (buffer.startsWith("mi")) { if (getNum(2, v)) { mKi = v; mI = 0; Serial.print("Motor Ki = "); Serial.println(mKi, 4); } else needNum = true; }
+  else if (buffer.startsWith("lp")) { if (getNum(2, v)) { lKp = v; Serial.print("Light Kp = "); Serial.println(lKp, 4); } else needNum = true; }
+  else if (buffer.startsWith("li")) { if (getNum(2, v)) { lKi = v; lI = 0; Serial.print("Light Ki = "); Serial.println(lKi, 4); } else needNum = true; }
+  else if (buffer.startsWith("lc")) { calibrateLight(); }
+  else if (buffer.startsWith("lu")) {
+    if (getNum(2, v)) {
+      lOpen = true; lOpenPWM = constrain((int)v, 0, 255);
+      Serial.print("LIGHT OPEN LOOP: PWM = "); Serial.println(lOpenPWM);
+    } else needNum = true;
+  }
+  else if (buffer.startsWith("vm")) { view = 1; Serial.println("Showing MOTOR only"); }
+  else if (buffer.startsWith("vl")) { view = 2; Serial.println("Showing LIGHT only"); }
+  else if (buffer.startsWith("vb")) { view = 0; Serial.println("Showing BOTH"); }
+  else if (buffer.startsWith("sp")) { if (getNum(2, v)) setMotorSP(v); else needNum = true; }
+  else if (first == 'm') { if (getNum(1, v)) setMotorSP(v); else needNum = true; }
+  else if (first == 'l') {
+    if (getNum(1, v)) {
+      if (lOpen) lI = lPWM;                    // bumpless switch from open loop
+      lOpen = false;
+      lSP = constrain(v, 0, 100);
+      Serial.print("LIGHT SETPOINT = "); Serial.print(lSP); Serial.println(" %");
+    } else needNum = true;
+  }
+  else if (first == 'u') {
+    if (getNum(1, v)) {
+      mOpen = true; mOpenPWM = constrain((int)v, 0, 255);
+      Serial.print("MOTOR OPEN LOOP: PWM = "); Serial.println(mOpenPWM);
+    } else needNum = true;
+  }
+  else if (first == 'r') {
+    stopMotor(); reverseDir = !reverseDir; setDirection();
+    Serial.println(reverseDir ? "Motor direction: REVERSE" : "Motor direction: FORWARD");
+  }
+  else if (first == 's') { printMagnetStatus(); }
+  else if (isDigit(first)) { if (getNum(0, v)) setMotorSP(v); }
+  else { Serial.println("Unknown command"); }
+
+  if (needNum) Serial.println("Command ignored: it needs a number, e.g. m1500 or l50");
+  buffer = "";
+}
+
+void printHelp() {
+  Serial.println("MOTOR: m1500 = setpoint RPM | u200 = open-loop PWM | m0 = stop");
+  Serial.println("       mp0.02 = Kp | mi0.3 = Ki | r = reverse | s = magnet status");
+  Serial.println("LIGHT: l50 = setpoint % | lu120 = open-loop PWM | lc = recalibrate");
+  Serial.println("       lp0.6 = Kp | li4 = Ki");
+  Serial.println("VIEW:  vm = motor only | vl = light only | vb = both");
+}
+
+// ================= SETUP =================
+void setup() {
+  pinMode(M_EN, OUTPUT); pinMode(M_IN1, OUTPUT); pinMode(M_IN2, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  setDirection();
+  analogWrite(M_EN, 0);
+  analogWrite(LED_PIN, 0);
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000) {}
+  Serial.println("=== BOARD (RE)STARTED ===");   // seeing this mid-run means the board reset
+  Wire.begin();
+
+  printMagnetStatus();
+  calibrateLight();
+  printHelp();
+
+  lastValid = millis(); lastI2C = millis(); lastSpeedMs = millis();
+  lastControl = millis();
+}
+
+// ================= LOOP =================
+void loop() {
+  // 1. Serial input
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    lastCharTime = millis();
+    if (c == '\n' || c == '\r') processInput();
+    else buffer += c;
+  }
+  if (buffer.length() > 0 && millis() - lastCharTime > 300) processInput();
+
+  // 2. Read the magnet angle as fast as possible
+  int raw;
+  int r = readSensor(raw);
+  if (r == 1) {
+    if (++failStreak >= 20) { recoverI2C(); failStreak = 0; lastRaw = -1; }
+  } else {
+    failStreak = 0;
+    samples++;
+    lastI2C = millis();
+    if (r == 0) {
+      magSamples++;
+      unsigned long nowUs = micros();
+      // Only compare readings taken close together. After a pause (e.g. printing)
+      // the shaft may have turned more than half a revolution, so skip that pair.
+      if (lastRaw >= 0 && nowUs - lastReadUs <= MAX_GAP_US) {
+        int d = raw - lastRaw;
+        if (d > 2048)       d -= 4096;
+        else if (d < -2048) d += 4096;
+        countAccum += d;
+        timeAccumUs += nowUs - lastReadUs;     // time actually measured
+      }
+      lastRaw = raw;
+      lastReadUs = nowUs;
+      lastValid = millis();
+    } else {
+      lastRaw = -1;
+    }
+  }
+
+  // 3. Every 20 ms: run both controllers
+  unsigned long now = millis();
+  if (now - lastControl >= CONTROL_MS) {
+    float dt = (now - lastControl) / 1000.0;
+    lastControl = now;
+
+    // ----- Motor speed PI -----
+    float rpm = rpmFilt;                       // no usable data this step: hold the last value
+    if (timeAccumUs > 0) {
+      rpm = (countAccum / 4096.0) / (timeAccumUs / 1000000.0) * 60.0;
+      lastSpeedMs = now;
+    }
+    countAccum = 0; timeAccumUs = 0;
+    rpmFilt = RPM_ALPHA * rpm + (1 - RPM_ALPHA) * rpmFilt;
+    float speed = fabs(rpmFilt);
+    bool i2cLost = (now - lastI2C  > I2C_LOST_MS);
+    bool magLost = (now - lastValid > MAG_LOST_MS);
+
+    if (mOpen) {
+      mPWM = mOpenPWM;
+      stallStart = 0;
+    } else if (mSP <= 0) {
+      stopMotor();
+      stallStart = 0;
+    } else if (i2cLost) {                        // sensor not replying: never run blind
+      stopMotor();
+      lastSpeedMs = now;
+      warn(1, "!! I2C LOST - sensor not replying, motor stopped (will resume if it returns)");
+    } else if (magLost) {                        // sensor fine, magnet not seen:
+      mI = 0;                                    // nudge the shaft off the dead angle
+      lastSpeedMs = now;
+      if (nudgeCount < MAX_NUDGES && now - lastNudge >= NUDGE_GAP_MS) {
+        lastNudge = now; nudgeCount++;
+      }
+      bool pulsing = (nudgeCount > 0 && now - lastNudge < NUDGE_MS);
+      mPWM = pulsing ? NUDGE_PWM : 0;
+      if (nudgeCount >= MAX_NUDGES && !pulsing)
+        warn(3, "!! MAGNET STILL NOT FOUND - check the magnet, then re-enter the setpoint");
+      else
+        warn(2, "!! MAGNET LOST - nudging the motor to find it");
+    } else if (now - lastSpeedMs > SPEED_STALE_MS) {   // replies too far apart to measure speed
+      stopMotor();
+      warn(4, "!! SPEED READINGS TOO SLOW - motor stopped (will resume when readings recover)");
+    } else {
+      if (warnState != 0) { Serial.println("Sensor OK - resuming control"); warnState = 0; }
+      nudgeCount = 0;
+      float e = mSP - speed;
+      float newI = mI + mKi * e * dt;
+      float u = mKp * e + newI;
+      if (u > 255)    { u = 255; if (e < 0) mI = newI; }
+      else if (u < 0) { u = 0;   if (e > 0) mI = newI; }
+      else            { mI = newI; }
+      mPWM = (int)u;
+
+      // Full power but not turning for 1.5 s = jammed motor or L293D shut down
+      if (mPWM >= 250 && speed < 50) {
+        if (stallStart == 0) stallStart = now;
+        else if (now - stallStart > 1500) {
+          stopMotor(); mSP = 0; stallStart = 0;
+          Serial.println("!! STALL - full power but no rotation. Motor stopped.");
+          Serial.println("   Check: shaft jammed? L293D hot? motor supply on? Then re-enter the setpoint.");
+        }
+      } else {
+        stallStart = 0;
+      }
+    }
+    analogWrite(M_EN, mPWM);
+
+    // ----- Light PI -----
+    ldrFilt = LDR_ALPHA * readLDR(5) + (1 - LDR_ALPHA) * ldrFilt;
+    lPV = lightPercent(ldrFilt);
+
+    if (lOpen) {
+      lPWM = lOpenPWM;
+    } else {
+      float e = lSP - lPV;
+      float newI = lI + lKi * e * dt;
+      float u = lKp * e + newI;
+      if (u > 255)    { u = 255; if (e < 0) lI = newI; }
+      else if (u < 0) { u = 0;   if (e > 0) lI = newI; }
+      else            { lI = newI; }
+      lPWM = (int)u;
+    }
+    analogWrite(LED_PIN, lPWM);
+  }
+
+  // 4. Print every 100 ms
+  if (now - lastPrint >= 100) {
+    lastPrint = now;
+    int magPct = samples > 0 ? (int)(magSamples * 100 / samples) : 0;
+    samples = 0; magSamples = 0;
+
+    if (view != 2) {
+      Serial.print("M_SP:");   Serial.print(mOpen ? 0 : mSP);
+      Serial.print(" M_RPM:"); Serial.print(fabs(rpmFilt));
+      Serial.print(" M_PWM:"); Serial.print(mPWM);
+      Serial.print(" MAG%:");  Serial.print(magPct);
+      Serial.print(" ");
+    }
+    if (view != 1) {
+      Serial.print("L_SP:");   Serial.print(lOpen ? 0 : lSP);
+      Serial.print(" L_PV:");  Serial.print(lPV);
+      Serial.print(" L_PWM:"); Serial.print(lPWM);
+    }
+    if (view != 2) {
+      if (now - lastI2C > I2C_LOST_MS)        Serial.print("  << I2C LOST");
+      else if (now - lastValid > MAG_LOST_MS) Serial.print("  << MAGNET LOST");
+    }
+    Serial.println();
+  }
+}
